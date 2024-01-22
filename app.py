@@ -1,6 +1,7 @@
 import os
 import cv2
 import math
+import spaces
 import torch
 import random
 import numpy as np
@@ -18,7 +19,6 @@ from insightface.app import FaceAnalysis
 from style_template import styles
 from pipeline_stable_diffusion_xl_instantid import StableDiffusionXLInstantIDPipeline
 
-import spaces
 import gradio as gr
 
 # global variable
@@ -34,7 +34,7 @@ hf_hub_download(repo_id="InstantX/InstantID", filename="ControlNetModel/diffusio
 hf_hub_download(repo_id="InstantX/InstantID", filename="ip-adapter.bin", local_dir="./checkpoints")
 
 # Load face encoder
-app = FaceAnalysis(name='antelopev2', root='./', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+app = FaceAnalysis(name='antelopev2', root='./', providers=['CPUExecutionProvider'])
 app.prepare(ctx_id=0, det_size=(640, 640))
 
 # Path to InstantID models
@@ -55,6 +55,8 @@ pipe = StableDiffusionXLInstantIDPipeline.from_pretrained(
 )
 pipe.cuda()
 pipe.load_ip_adapter_instantid(face_adapter)
+pipe.image_proj_model.to('cuda')
+pipe.unet.to('cuda')
 
 def randomize_seed_fn(seed: int, randomize_seed: bool) -> int:
     if randomize_seed:
