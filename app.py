@@ -403,8 +403,10 @@ with gr.Blocks(css=css) as demo:
         run_on_click=True,
         fn=upload_example_to_gallery,
         outputs=[uploaded_faces, clear_button_face, face_files],
+        cache_examples=True
     )
     
     gr.Markdown(article)
 
+demo.queue(api_open=False)
 demo.launch()
