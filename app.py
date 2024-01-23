@@ -404,8 +404,8 @@ with gr.Blocks(css=css) as demo:
         examples=get_example(),
         inputs=[face_files, prompt, style, negative_prompt],
         run_on_click=True,
-        fn=run_for_examples,
-        outputs=[gallery, usage_tips],
+        fn=upload_example_to_gallery,
+        outputs=[uploaded_faces, clear_button_face, face_files],
         cache_examples=True
     )
     
