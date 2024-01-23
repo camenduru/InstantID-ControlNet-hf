@@ -110,6 +110,9 @@ def get_example():
     ]
     return case
 
+def run_for_examples(face_files, prompt, style, negative_prompt):
+    return generate_image(face_files, None, prompt, negative_prompt, style, True, 30, 0.8, 0.8, 5, 42)
+
 def convert_from_cv2_to_image(img: np.ndarray) -> Image:
     return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
 
@@ -401,12 +404,13 @@ with gr.Blocks(css=css) as demo:
         examples=get_example(),
         inputs=[face_files, prompt, style, negative_prompt],
         run_on_click=True,
-        fn=upload_example_to_gallery,
-        outputs=[uploaded_faces, clear_button_face, face_files],
+        fn=run_for_examples,
+        outputs=[gallery, usage_tips],
         cache_examples=True
     )
     
     gr.Markdown(article)
+
 
 demo.queue(api_open=False)
 demo.launch()
