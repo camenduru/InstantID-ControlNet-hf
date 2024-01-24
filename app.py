@@ -362,7 +362,7 @@ with gr.Blocks(css=css) as demo:
                 negative_prompt = gr.Textbox(
                     label="Negative Prompt",
                     placeholder="low quality",
-                    value="(lowres, low quality, worst quality:1.2), (text:1.2), watermark, (frame:1.2), deformed, ugly, deformed eyes, blur, out of focus, blurry, deformed cat, deformed, photo, anthropomorphic cat, monochrome, pet collar, gun, weapon, blue, 3d, drones, drone, buildings in background, green",
+                    value="(lowres, low quality, worst quality:1.2), (text:1.2), watermark, (frame:1.2), deformed, ugly, deformed eyes, blur, out of focus, blurry, deformed cat, deformed, nudity,naked, bikini, skimpy, scanty, bare skin, lingerie, swimsuit, exposed, see-through, photo, anthropomorphic cat, monochrome, pet collar, gun, weapon, blue, 3d, drones, drone, buildings in background, green",
                 )
                 num_steps = gr.Slider(
                     label="Number of sample steps",
