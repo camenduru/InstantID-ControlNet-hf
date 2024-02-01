@@ -129,13 +129,14 @@ pipe.scheduler = diffusers.EulerDiscreteScheduler.from_config(
     pipe.scheduler.config
 )
 
+# load and disable LCM
+pipe.load_lora_weights("latent-consistency/lcm-lora-sdxl")
+pipe.disable_lora()
+
 pipe.cuda()
 pipe.load_ip_adapter_instantid(face_adapter)
 pipe.image_proj_model.to("cuda")
 pipe.unet.to("cuda")
-# load and disable LCM
-pipe.load_lora_weights("latent-consistency/lcm-lora-sdxl")
-pipe.disable_lora()
 
 def toggle_lcm_ui(value):
     if value:
@@ -425,10 +426,10 @@ article = r"""
 If our work is helpful for your research or applications, please cite us via:
 ```bibtex
 @article{wang2024instantid,
-title={InstantID: Zero-shot Identity-Preserving Generation in Seconds},
-author={Wang, Qixun and Bai, Xu and Wang, Haofan and Qin, Zekui and Chen, Anthony},
-journal={arXiv preprint arXiv:2401.07519},
-year={2024}
+  title={InstantID: Zero-shot Identity-Preserving Generation in Seconds},
+  author={Wang, Qixun and Bai, Xu and Wang, Haofan and Qin, Zekui and Chen, Anthony},
+  journal={arXiv preprint arXiv:2401.07519},
+  year={2024}
 }
 ```
 📧 **Contact**
