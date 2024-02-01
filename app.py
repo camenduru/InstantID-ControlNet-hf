@@ -18,7 +18,6 @@ from insightface.app import FaceAnalysis
 
 from style_template import styles
 from pipeline_stable_diffusion_xl_instantid_full import StableDiffusionXLInstantIDPipeline, draw_kps
-from model_util import load_models_xl, get_torch_device
 from controlnet_util import openpose, get_depth_map, get_canny_image
 
 import gradio as gr
@@ -27,7 +26,7 @@ import spaces
 
 # global variable
 MAX_SEED = np.iinfo(np.int32).max
-device = get_torch_device()
+device = "cuda" if torch.cuda.is_available() else "cpu"
 dtype = torch.float16 if str(device).__contains__("cuda") else torch.float32
 STYLE_NAMES = list(styles.keys())
 DEFAULT_STYLE_NAME = "Watercolor"
