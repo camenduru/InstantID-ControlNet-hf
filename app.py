@@ -1,4 +1,3 @@
-import os
 import cv2
 import torch
 import random
@@ -20,9 +19,35 @@ from insightface.app import FaceAnalysis
 
 from style_template import styles
 from pipeline_stable_diffusion_xl_instantid_full import StableDiffusionXLInstantIDPipeline, draw_kps
-from controlnet_util import openpose, get_depth_map, get_canny_image
 
+from controlnet_aux import OpenposeDetector
+from transformers import DPTImageProcessor, DPTForDepthEstimation
 import gradio as gr
+
+def get_depth_map(image):
+    image = feature_extractor(images=image, return_tensors="pt").pixel_values.to("cuda")
+    with torch.no_grad(), torch.autocast("cuda"):
+        depth_map = depth_estimator(image).predicted_depth
+
+    depth_map = torch.nn.functional.interpolate(
+        depth_map.unsqueeze(1),
+        size=(1024, 1024),
+        mode="bicubic",
+        align_corners=False,
+    )
+    depth_min = torch.amin(depth_map, dim=[1, 2, 3], keepdim=True)
+    depth_max = torch.amax(depth_map, dim=[1, 2, 3], keepdim=True)
+    depth_map = (depth_map - depth_min) / (depth_max - depth_min)
+    image = torch.cat([depth_map] * 3, dim=1)
+
+    image = image.permute(0, 2, 3, 1).cpu().numpy()[0]
+    image = Image.fromarray((image * 255.0).clip(0, 255).astype(np.uint8))
+    return image
+
+def get_canny_image(image, t1=100, t2=200):
+    image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+    edges = cv2.Canny(image, t1, t2)
+    return Image.fromarray(edges, "L")
 
 # global variable
 MAX_SEED = np.iinfo(np.int32).max
@@ -46,9 +71,13 @@ hf_hub_download(repo_id="InstantX/InstantID", filename="ip-adapter.bin", local_d
 app = FaceAnalysis(
     name="antelopev2",
     root="./",
-    providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+    providers=["CPUExecutionProvider"],
 )
 app.prepare(ctx_id=0, det_size=(640, 640))
+
+depth_estimator = DPTForDepthEstimation.from_pretrained("Intel/dpt-hybrid-midas").to(device)
+feature_extractor = DPTImageProcessor.from_pretrained("Intel/dpt-hybrid-midas")
+openpose = OpenposeDetector.from_pretrained("lllyasviel/ControlNet")
 
 # Path to InstantID models
 face_adapter = f"./checkpoints/ip-adapter.bin"
@@ -59,7 +88,7 @@ controlnet_identitynet = ControlNetModel.from_pretrained(
     controlnet_path, torch_dtype=dtype
 )
 
-# controlnet-pose
+# controlnet-pose/canny/depth
 controlnet_pose_model = "thibaud/controlnet-openpose-sdxl-1.0"
 controlnet_canny_model = "diffusers/controlnet-canny-sdxl-1.0"
 controlnet_depth_model = "diffusers/controlnet-depth-sdxl-1.0-small"
