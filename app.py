@@ -55,6 +55,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 dtype = torch.float16 if str(device).__contains__("cuda") else torch.float32
 STYLE_NAMES = list(styles.keys())
 DEFAULT_STYLE_NAME = "Watercolor"
+enable_lcm_arg = False
 
 # download checkpoints
 from huggingface_hub import hf_hub_download
