@@ -129,6 +129,7 @@ pipe.scheduler = diffusers.EulerDiscreteScheduler.from_config(
     pipe.scheduler.config
 )
 
+pipe.cuda()
 pipe.load_ip_adapter_instantid(face_adapter)
 # load and disable LCM
 pipe.load_lora_weights("latent-consistency/lcm-lora-sdxl")
