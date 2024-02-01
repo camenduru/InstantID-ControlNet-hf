@@ -1,23 +1,34 @@
-import math
-import random
-
+import os
 import cv2
-import gradio as gr
-import numpy as np
-import PIL
-import spaces
 import torch
-from diffusers.models import ControlNetModel
-from diffusers.utils import load_image
-from insightface.app import FaceAnalysis
+import random
+import numpy as np
+
+import PIL
 from PIL import Image
 
-from pipeline_stable_diffusion_xl_instantid import StableDiffusionXLInstantIDPipeline
+import diffusers
+from diffusers.utils import load_image
+from diffusers.models import ControlNetModel
+from diffusers.pipelines.controlnet.multicontrolnet import MultiControlNetModel
+
+from huggingface_hub import hf_hub_download
+
+from insightface.app import FaceAnalysis
+
 from style_template import styles
+from pipeline_stable_diffusion_xl_instantid_full import StableDiffusionXLInstantIDPipeline, draw_kps
+from model_util import load_models_xl, get_torch_device
+from controlnet_util import openpose, get_depth_map, get_canny_image
+
+import gradio as gr
+
+import spaces
 
 # global variable
 MAX_SEED = np.iinfo(np.int32).max
-device = "cuda" if torch.cuda.is_available() else "cpu"
+device = get_torch_device()
+dtype = torch.float16 if str(device).__contains__("cuda") else torch.float32
 STYLE_NAMES = list(styles.keys())
 DEFAULT_STYLE_NAME = "Watercolor"
 
@@ -33,69 +44,120 @@ hf_hub_download(
 hf_hub_download(repo_id="InstantX/InstantID", filename="ip-adapter.bin", local_dir="./checkpoints")
 
 # Load face encoder
-app = FaceAnalysis(name="antelopev2", root="./", providers=["CPUExecutionProvider"])
+app = FaceAnalysis(
+    name="antelopev2",
+    root="./",
+    providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+)
 app.prepare(ctx_id=0, det_size=(640, 640))
 
 # Path to InstantID models
-face_adapter = "./checkpoints/ip-adapter.bin"
-controlnet_path = "./checkpoints/ControlNetModel"
+face_adapter = f"./checkpoints/ip-adapter.bin"
+controlnet_path = f"./checkpoints/ControlNetModel"
 
-# Load pipeline
-controlnet = ControlNetModel.from_pretrained(controlnet_path, torch_dtype=torch.float16)
+# Load pipeline face ControlNetModel
+controlnet_identitynet = ControlNetModel.from_pretrained(
+    controlnet_path, torch_dtype=dtype
+)
 
-base_model_path = "wangqixun/YamerMIX_v8"
+# controlnet-pose
+controlnet_pose_model = "thibaud/controlnet-openpose-sdxl-1.0"
+controlnet_canny_model = "diffusers/controlnet-canny-sdxl-1.0"
+controlnet_depth_model = "diffusers/controlnet-depth-sdxl-1.0-small"
+
+controlnet_pose = ControlNetModel.from_pretrained(
+    controlnet_pose_model, torch_dtype=dtype
+).to(device)
+controlnet_canny = ControlNetModel.from_pretrained(
+    controlnet_canny_model, torch_dtype=dtype
+).to(device)
+controlnet_depth = ControlNetModel.from_pretrained(
+    controlnet_depth_model, torch_dtype=dtype
+).to(device)
+
+controlnet_map = {
+    "pose": controlnet_pose,
+    "canny": controlnet_canny,
+    "depth": controlnet_depth,
+}
+controlnet_map_fn = {
+    "pose": openpose,
+    "canny": get_canny_image,
+    "depth": get_depth_map,
+}
+
+pretrained_model_name_or_path = "wangqixun/YamerMIX_v8"
 
 pipe = StableDiffusionXLInstantIDPipeline.from_pretrained(
-    base_model_path,
-    controlnet=controlnet,
-    torch_dtype=torch.float16,
+    pretrained_model_name_or_path,
+    controlnet=[controlnet_identitynet],
+    torch_dtype=dtype,
     safety_checker=None,
     feature_extractor=None,
-)
-pipe.cuda()
-pipe.load_ip_adapter_instantid(face_adapter)
-pipe.image_proj_model.to("cuda")
-pipe.unet.to("cuda")
+).to(device)
 
+pipe.scheduler = diffusers.EulerDiscreteScheduler.from_config(
+    pipe.scheduler.config
+)
+
+pipe.load_ip_adapter_instantid(face_adapter)
+# load and disable LCM
+pipe.load_lora_weights("latent-consistency/lcm-lora-sdxl")
+pipe.disable_lora()
+
+def toggle_lcm_ui(value):
+    if value:
+        return (
+            gr.update(minimum=0, maximum=100, step=1, value=5),
+            gr.update(minimum=0.1, maximum=20.0, step=0.1, value=1.5),
+        )
+    else:
+        return (
+            gr.update(minimum=5, maximum=100, step=1, value=30),
+            gr.update(minimum=0.1, maximum=20.0, step=0.1, value=5),
+        )
 
 def randomize_seed_fn(seed: int, randomize_seed: bool) -> int:
     if randomize_seed:
         seed = random.randint(0, MAX_SEED)
     return seed
 
-
 def remove_tips():
     return gr.update(visible=False)
-
 
 def get_example():
     case = [
         [
             "./examples/yann-lecun_resize.jpg",
+            None,
             "a man",
             "Snow",
             "(lowres, low quality, worst quality:1.2), (text:1.2), watermark, (frame:1.2), deformed, ugly, deformed eyes, blur, out of focus, blurry, deformed cat, deformed, photo, anthropomorphic cat, monochrome, photo, pet collar, gun, weapon, blue, 3d, drones, drone, buildings in background, green",
         ],
         [
             "./examples/musk_resize.jpeg",
-            "a man",
+            "./examples/poses/pose2.jpg",
+            "a man flying in the sky in Mars",
             "Mars",
             "(lowres, low quality, worst quality:1.2), (text:1.2), watermark, (frame:1.2), deformed, ugly, deformed eyes, blur, out of focus, blurry, deformed cat, deformed, photo, anthropomorphic cat, monochrome, photo, pet collar, gun, weapon, blue, 3d, drones, drone, buildings in background, green",
         ],
         [
             "./examples/sam_resize.png",
-            "a man",
+            "./examples/poses/pose4.jpg",
+            "a man doing a silly pose wearing a suite",
             "Jungle",
             "(lowres, low quality, worst quality:1.2), (text:1.2), watermark, (frame:1.2), deformed, ugly, deformed eyes, blur, out of focus, blurry, deformed cat, deformed, photo, anthropomorphic cat, monochrome, photo, pet collar, gun, weapon, blue, 3d, drones, drone, buildings in background, gree",
         ],
         [
             "./examples/schmidhuber_resize.png",
-            "a man",
+            "./examples/poses/pose3.jpg",
+            "a man sit on a chair",
             "Neon",
             "(lowres, low quality, worst quality:1.2), (text:1.2), watermark, (frame:1.2), deformed, ugly, deformed eyes, blur, out of focus, blurry, deformed cat, deformed, photo, anthropomorphic cat, monochrome, photo, pet collar, gun, weapon, blue, 3d, drones, drone, buildings in background, green",
         ],
         [
             "./examples/kaifu_resize.png",
+            "./examples/poses/pose.jpg",
             "a man",
             "Vibrant Color",
             "(lowres, low quality, worst quality:1.2), (text:1.2), watermark, (frame:1.2), deformed, ugly, deformed eyes, blur, out of focus, blurry, deformed cat, deformed, photo, anthropomorphic cat, monochrome, photo, pet collar, gun, weapon, blue, 3d, drones, drone, buildings in background, green",
@@ -103,49 +165,32 @@ def get_example():
     ]
     return case
 
-
-def run_for_examples(face_file, prompt, style, negative_prompt):
-    return generate_image(face_file, None, prompt, negative_prompt, style, True, 30, 0.8, 0.8, 5, 42)
-
+def run_for_examples(face_file, pose_file, prompt, style, negative_prompt):
+    return generate_image(
+        face_file,
+        pose_file,
+        prompt,
+        negative_prompt,
+        style,
+        20,  # num_steps
+        0.8,  # identitynet_strength_ratio
+        0.8,  # adapter_strength_ratio
+        0.4,  # pose_strength
+        0.3,  # canny_strength
+        0.5,  # depth_strength
+        ["pose", "canny"],  # controlnet_selection
+        5.0,  # guidance_scale
+        42,  # seed
+        "EulerDiscreteScheduler",  # scheduler
+        False,  # enable_LCM
+        True,  # enable_Face_Region
+    )
 
 def convert_from_cv2_to_image(img: np.ndarray) -> Image:
     return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
 
-
 def convert_from_image_to_cv2(img: Image) -> np.ndarray:
     return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-
-
-def draw_kps(image_pil, kps, color_list=[(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255)]):
-    stickwidth = 4
-    limbSeq = np.array([[0, 2], [1, 2], [3, 2], [4, 2]])
-    kps = np.array(kps)
-
-    w, h = image_pil.size
-    out_img = np.zeros([h, w, 3])
-
-    for i in range(len(limbSeq)):
-        index = limbSeq[i]
-        color = color_list[index[0]]
-
-        x = kps[index][:, 0]
-        y = kps[index][:, 1]
-        length = ((x[0] - x[1]) ** 2 + (y[0] - y[1]) ** 2) ** 0.5
-        angle = math.degrees(math.atan2(y[0] - y[1], x[0] - x[1]))
-        polygon = cv2.ellipse2Poly(
-            (int(np.mean(x)), int(np.mean(y))), (int(length / 2), stickwidth), int(angle), 0, 360, 1
-        )
-        out_img = cv2.fillConvexPoly(out_img.copy(), polygon, color)
-    out_img = (out_img * 0.6).astype(np.uint8)
-
-    for idx_kp, kp in enumerate(kps):
-        color = color_list[idx_kp]
-        x, y = kp
-        out_img = cv2.circle(out_img.copy(), (int(x), int(y)), 10, color, -1)
-
-    out_img_pil = Image.fromarray(out_img.astype(np.uint8))
-    return out_img_pil
-
 
 def resize_img(
     input_image,
@@ -172,20 +217,17 @@ def resize_img(
         res = np.ones([max_side, max_side, 3], dtype=np.uint8) * 255
         offset_x = (max_side - w_resize_new) // 2
         offset_y = (max_side - h_resize_new) // 2
-        res[offset_y : offset_y + h_resize_new, offset_x : offset_x + w_resize_new] = np.array(input_image)
+        res[
+            offset_y : offset_y + h_resize_new, offset_x : offset_x + w_resize_new
+        ] = np.array(input_image)
         input_image = Image.fromarray(res)
     return input_image
 
-
-def apply_style(style_name: str, positive: str, negative: str = "") -> tuple[str, str]:
+def apply_style(
+    style_name: str, positive: str, negative: str = ""
+) -> tuple[str, str]:
     p, n = styles.get(style_name, styles[DEFAULT_STYLE_NAME])
     return p.replace("{prompt}", positive), n + " " + negative
-
-
-def check_input_image(face_image):
-    if face_image is None:
-        raise gr.Error("Cannot find any input face image! Please upload the face image")
-
 
 @spaces.GPU
 def generate_image(
@@ -194,14 +236,41 @@ def generate_image(
     prompt,
     negative_prompt,
     style_name,
-    enhance_face_region,
     num_steps,
     identitynet_strength_ratio,
     adapter_strength_ratio,
+    pose_strength,
+    canny_strength,
+    depth_strength,
+    controlnet_selection,
     guidance_scale,
     seed,
+    scheduler,
+    enable_LCM,
+    enhance_face_region,
     progress=gr.Progress(track_tqdm=True),
 ):
+
+    if enable_LCM:
+        pipe.scheduler = diffusers.LCMScheduler.from_config(pipe.scheduler.config)
+        pipe.enable_lora()
+    else:
+        pipe.disable_lora()
+        scheduler_class_name = scheduler.split("-")[0]
+
+        add_kwargs = {}
+        if len(scheduler.split("-")) > 1:
+            add_kwargs["use_karras_sigmas"] = True
+        if len(scheduler.split("-")) > 2:
+            add_kwargs["algorithm_type"] = "sde-dpmsolver++"
+        scheduler = getattr(diffusers, scheduler_class_name)
+        pipe.scheduler = scheduler.from_config(pipe.scheduler.config, **add_kwargs)
+
+    if face_image_path is None:
+        raise gr.Error(
+            f"Cannot find any input face image! Please upload the face image"
+        )
+
     if prompt is None:
         prompt = "a person"
 
@@ -209,7 +278,7 @@ def generate_image(
     prompt, negative_prompt = apply_style(style_name, prompt, negative_prompt)
 
     face_image = load_image(face_image_path)
-    face_image = resize_img(face_image)
+    face_image = resize_img(face_image, max_side=1024)
     face_image_cv2 = convert_from_image_to_cv2(face_image)
     height, width, _ = face_image_cv2.shape
 
@@ -217,23 +286,31 @@ def generate_image(
     face_info = app.get(face_image_cv2)
 
     if len(face_info) == 0:
-        raise gr.Error("Cannot find any face in the image! Please upload another person image")
+        raise gr.Error(
+            f"Unable to detect a face in the image. Please upload a different photo with a clear face."
+        )
 
-    face_info = sorted(face_info, key=lambda x: (x["bbox"][2] - x["bbox"][0]) * x["bbox"][3] - x["bbox"][1])[
+    face_info = sorted(
+        face_info,
+        key=lambda x: (x["bbox"][2] - x["bbox"][0]) * x["bbox"][3] - x["bbox"][1],
+    )[
         -1
     ]  # only use the maximum face
     face_emb = face_info["embedding"]
     face_kps = draw_kps(convert_from_cv2_to_image(face_image_cv2), face_info["kps"])
-
+    img_controlnet = face_image
     if pose_image_path is not None:
         pose_image = load_image(pose_image_path)
-        pose_image = resize_img(pose_image)
+        pose_image = resize_img(pose_image, max_side=1024)
+        img_controlnet = pose_image
         pose_image_cv2 = convert_from_image_to_cv2(pose_image)
 
         face_info = app.get(pose_image_cv2)
 
         if len(face_info) == 0:
-            raise gr.Error("Cannot find any face in the reference image! Please upload another person image")
+            raise gr.Error(
+                f"Cannot find any face in the reference image! Please upload another person image"
+            )
 
         face_info = face_info[-1]
         face_kps = draw_kps(pose_image, face_info["kps"])
@@ -249,6 +326,28 @@ def generate_image(
     else:
         control_mask = None
 
+    if len(controlnet_selection) > 0:
+        controlnet_scales = {
+            "pose": pose_strength,
+            "canny": canny_strength,
+            "depth": depth_strength,
+        }
+        pipe.controlnet = MultiControlNetModel(
+            [controlnet_identitynet]
+            + [controlnet_map[s] for s in controlnet_selection]
+        )
+        control_scales = [float(identitynet_strength_ratio)] + [
+            controlnet_scales[s] for s in controlnet_selection
+        ]
+        control_images = [face_kps] + [
+            controlnet_map_fn[s](img_controlnet).resize((width, height))
+            for s in controlnet_selection
+        ]
+    else:
+        pipe.controlnet = controlnet_identitynet
+        control_scales = float(identitynet_strength_ratio)
+        control_images = face_kps
+
     generator = torch.Generator(device=device).manual_seed(seed)
 
     print("Start inference...")
@@ -259,9 +358,9 @@ def generate_image(
         prompt=prompt,
         negative_prompt=negative_prompt,
         image_embeds=face_emb,
-        image=face_kps,
+        image=control_images,
         control_mask=control_mask,
-        controlnet_conditioning_scale=float(identitynet_strength_ratio),
+        controlnet_conditioning_scale=control_scales,
         num_inference_steps=num_steps,
         guidance_scale=guidance_scale,
         height=height,
@@ -271,8 +370,7 @@ def generate_image(
 
     return images[0], gr.update(visible=True)
 
-
-### Description
+# Description
 title = r"""
 <h1 align="center">InstantID: Zero-shot Identity-Preserving Generation in Seconds</h1>
 """
@@ -281,12 +379,12 @@ description = r"""
 <b>Official 🤗 Gradio demo</b> for <a href='https://github.com/InstantID/InstantID' target='_blank'><b>InstantID: Zero-shot Identity-Preserving Generation in Seconds</b></a>.<br>
 
 How to use:<br>
-1. Upload a person image. For multiple person images, we will only detect the biggest face. Make sure face is not too small and not significantly blocked or blurred.
-2. (Optionally) upload another person image as reference pose. If not uploaded, we will use the first person image to extract landmarks. If you use a cropped face at step1, it is recommeneded to upload it to extract a new pose.
-3. Enter a text prompt as done in normal text-to-image models.
-4. Click the <b>Submit</b> button to start customizing.
-5. Share your customizd photo with your friends, enjoy😊!
-"""
+1. Upload an image with a face. For images with multiple faces, we will only detect the largest face. Ensure the face is not too small and is clearly visible without significant obstructions or blurring.
+2. (Optional) You can upload another image as a reference for the face pose. If you don't, we will use the first detected face image to extract facial landmarks. If you use a cropped face at step 1, it is recommended to upload it to define a new face pose.
+3. (Optional) You can select multiple ControlNet models to control the generation process. The default is to use the IdentityNet only. The ControlNet models include pose skeleton, canny, and depth. You can adjust the strength of each ControlNet model to control the generation process.
+4. Enter a text prompt, as done in normal text-to-image models.
+5. Click the <b>Submit</b> button to begin customization.
+6. Share your customized photo with your friends and enjoy! 😊"""
 
 article = r"""
 ---
@@ -295,10 +393,10 @@ article = r"""
 If our work is helpful for your research or applications, please cite us via:
 ```bibtex
 @article{wang2024instantid,
-  title={InstantID: Zero-shot Identity-Preserving Generation in Seconds},
-  author={Wang, Qixun and Bai, Xu and Wang, Haofan and Qin, Zekui and Chen, Anthony},
-  journal={arXiv preprint arXiv:2401.07519},
-  year={2024}
+title={InstantID: Zero-shot Identity-Preserving Generation in Seconds},
+author={Wang, Qixun and Bai, Xu and Wang, Haofan and Qin, Zekui and Chen, Anthony},
+journal={arXiv preprint arXiv:2401.07519},
+year={2024}
 }
 ```
 📧 **Contact**
@@ -308,10 +406,10 @@ If you have any questions, please feel free to open an issue or directly reach u
 
 tips = r"""
 ### Usage tips of InstantID
-1. If you're unsatisfied with the similarity, increase the weight of controlnet_conditioning_scale (IdentityNet) and ip_adapter_scale (Adapter).
-2. If the generated image is over-saturated, decrease the ip_adapter_scale. If not work, decrease controlnet_conditioning_scale.
-3. If text control is not as expected, decrease ip_adapter_scale.
-4. Find a good base model always makes a difference.
+1. If you're not satisfied with the similarity, try increasing the weight of "IdentityNet Strength" and "Adapter Strength."    
+2. If you feel that the saturation is too high, first decrease the Adapter strength. If it remains too high, then decrease the IdentityNet strength.
+3. If you find that text control is not as expected, decrease Adapter strength.
+4. If you find that realistic style is not good enough, go for our Github repo and use a more realistic base model.
 """
 
 css = """
@@ -324,27 +422,39 @@ with gr.Blocks(css=css) as demo:
 
     with gr.Row():
         with gr.Column():
-            # upload face image
-            face_file = gr.Image(label="Upload a photo of your face", type="filepath")
-
-            # optional: upload a reference pose image
-            pose_file = gr.Image(label="Upload a reference pose image (optional)", type="filepath")
+            with gr.Row(equal_height=True):
+                # upload face image
+                face_file = gr.Image(
+                    label="Upload a photo of your face", type="filepath"
+                )
+                # optional: upload a reference pose image
+                pose_file = gr.Image(
+                    label="Upload a reference pose image (Optional)",
+                    type="filepath",
+                )
 
             # prompt
             prompt = gr.Textbox(
                 label="Prompt",
-                info="Give simple prompt is enough to achieve good face fedility",
+                info="Give simple prompt is enough to achieve good face fidelity",
                 placeholder="A photo of a person",
                 value="",
             )
 
             submit = gr.Button("Submit", variant="primary")
-
-            style = gr.Dropdown(label="Style template", choices=STYLE_NAMES, value=DEFAULT_STYLE_NAME)
+            enable_LCM = gr.Checkbox(
+                label="Enable Fast Inference with LCM", value=enable_lcm_arg,
+                info="LCM speeds up the inference step, the trade-off is the quality of the generated image. It performs better with portrait face images rather than distant faces",
+            )
+            style = gr.Dropdown(
+                label="Style template",
+                choices=STYLE_NAMES,
+                value=DEFAULT_STYLE_NAME,
+            )
 
             # strength
             identitynet_strength_ratio = gr.Slider(
-                label="IdentityNet strength (for fedility)",
+                label="IdentityNet strength (for fidelity)",
                 minimum=0,
                 maximum=1.5,
                 step=0.05,
@@ -357,26 +467,51 @@ with gr.Blocks(css=css) as demo:
                 step=0.05,
                 value=0.80,
             )
-
+            with gr.Accordion("Controlnet"):
+                controlnet_selection = gr.CheckboxGroup(
+                    ["pose", "canny", "depth"], label="Controlnet", value=["pose"],
+                    info="Use pose for skeleton inference, canny for edge detection, and depth for depth map estimation. You can try all three to control the generation process"
+                )
+                pose_strength = gr.Slider(
+                    label="Pose strength",
+                    minimum=0,
+                    maximum=1.5,
+                    step=0.05,
+                    value=0.40,
+                )
+                canny_strength = gr.Slider(
+                    label="Canny strength",
+                    minimum=0,
+                    maximum=1.5,
+                    step=0.05,
+                    value=0.40,
+                )
+                depth_strength = gr.Slider(
+                    label="Depth strength",
+                    minimum=0,
+                    maximum=1.5,
+                    step=0.05,
+                    value=0.40,
+                )
             with gr.Accordion(open=False, label="Advanced Options"):
                 negative_prompt = gr.Textbox(
                     label="Negative Prompt",
                     placeholder="low quality",
-                    value="(lowres, low quality, worst quality:1.2), (text:1.2), watermark, (frame:1.2), deformed, ugly, deformed eyes, blur, out of focus, blurry, deformed cat, deformed, nudity,naked, bikini, skimpy, scanty, bare skin, lingerie, swimsuit, exposed, see-through, photo, anthropomorphic cat, monochrome, pet collar, gun, weapon, blue, 3d, drones, drone, buildings in background, green",
+                    value="(lowres, low quality, worst quality:1.2), (text:1.2), watermark, (frame:1.2), deformed, ugly, deformed eyes, blur, out of focus, blurry, deformed cat, deformed, photo, anthropomorphic cat, monochrome, pet collar, gun, weapon, blue, 3d, drones, drone, buildings in background, green",
                 )
                 num_steps = gr.Slider(
                     label="Number of sample steps",
-                    minimum=20,
+                    minimum=1,
                     maximum=100,
                     step=1,
-                    value=30,
+                    value=5 if enable_lcm_arg else 30,
                 )
                 guidance_scale = gr.Slider(
                     label="Guidance scale",
                     minimum=0.1,
-                    maximum=10.0,
+                    maximum=20.0,
                     step=0.1,
-                    value=5,
+                    value=0.0 if enable_lcm_arg else 5.0,
                 )
                 seed = gr.Slider(
                     label="Seed",
@@ -385,18 +520,31 @@ with gr.Blocks(css=css) as demo:
                     step=1,
                     value=42,
                 )
+                schedulers = [
+                    "DEISMultistepScheduler",
+                    "HeunDiscreteScheduler",
+                    "EulerDiscreteScheduler",
+                    "DPMSolverMultistepScheduler",
+                    "DPMSolverMultistepScheduler-Karras",
+                    "DPMSolverMultistepScheduler-Karras-SDE",
+                ]
+                scheduler = gr.Dropdown(
+                    label="Schedulers",
+                    choices=schedulers,
+                    value="EulerDiscreteScheduler",
+                )
                 randomize_seed = gr.Checkbox(label="Randomize seed", value=True)
                 enhance_face_region = gr.Checkbox(label="Enhance non-face region", value=True)
 
-        with gr.Column():
-            output_image = gr.Image(label="Generated Image")
-            usage_tips = gr.Markdown(label="Usage tips of InstantID", value=tips, visible=False)
+        with gr.Column(scale=1):
+            gallery = gr.Image(label="Generated Images")
+            usage_tips = gr.Markdown(
+                label="InstantID Usage Tips", value=tips, visible=False
+            )
 
         submit.click(
             fn=remove_tips,
             outputs=usage_tips,
-            queue=False,
-            api_name=False,
         ).then(
             fn=randomize_seed_fn,
             inputs=[seed, randomize_seed],
@@ -404,11 +552,6 @@ with gr.Blocks(css=css) as demo:
             queue=False,
             api_name=False,
         ).then(
-            fn=check_input_image,
-            inputs=face_file,
-            queue=False,
-            api_name=False,
-        ).success(
             fn=generate_image,
             inputs=[
                 face_file,
@@ -416,21 +559,34 @@ with gr.Blocks(css=css) as demo:
                 prompt,
                 negative_prompt,
                 style,
-                enhance_face_region,
                 num_steps,
                 identitynet_strength_ratio,
                 adapter_strength_ratio,
+                pose_strength,
+                canny_strength,
+                depth_strength,
+                controlnet_selection,
                 guidance_scale,
                 seed,
+                scheduler,
+                enable_LCM,
+                enhance_face_region,
             ],
-            outputs=[output_image, usage_tips],
+            outputs=[gallery, usage_tips],
+        )
+
+        enable_LCM.input(
+            fn=toggle_lcm_ui,
+            inputs=[enable_LCM],
+            outputs=[num_steps, guidance_scale],
+            queue=False,
         )
 
     gr.Examples(
         examples=get_example(),
-        inputs=[face_file, prompt, style, negative_prompt],
-        outputs=[output_image, usage_tips],
+        inputs=[face_file, pose_file, prompt, style, negative_prompt],
         fn=run_for_examples,
+        outputs=[gallery, usage_tips],
         cache_examples=True,
     )
 

@@ -22,7 +22,6 @@ import numpy as np
 import PIL.Image
 import torch
 import torch.nn.functional as F
-from transformers import CLIPTokenizer
 
 from diffusers.image_processor import PipelineImageInput
 
@@ -41,8 +40,12 @@ from diffusers.pipelines.controlnet.multicontrolnet import MultiControlNetModel
 from diffusers.utils.import_utils import is_xformers_available
 
 from ip_adapter.resampler import Resampler
+from ip_adapter.utils import is_torch2_available
 
-from ip_adapter.attention_processor import AttnProcessor, IPAttnProcessor
+if is_torch2_available():
+    from ip_adapter.attention_processor import IPAttnProcessor2_0 as IPAttnProcessor, AttnProcessor2_0 as AttnProcessor
+else:
+    from ip_adapter.attention_processor import IPAttnProcessor, AttnProcessor
 from ip_adapter.attention_processor import region_control
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -102,7 +105,7 @@ EXAMPLE_DOC_STRING = """
         ```
 """
 
-
+from transformers import CLIPTokenizer
 from diffusers.pipelines.stable_diffusion_xl import StableDiffusionXLPipeline
 class LongPromptWeight(object):
     
@@ -482,6 +485,34 @@ class LongPromptWeight(object):
         prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
         return prompt_embeds
 
+def draw_kps(image_pil, kps, color_list=[(255,0,0), (0,255,0), (0,0,255), (255,255,0), (255,0,255)]):
+    
+    stickwidth = 4
+    limbSeq = np.array([[0, 2], [1, 2], [3, 2], [4, 2]])
+    kps = np.array(kps)
+
+    w, h = image_pil.size
+    out_img = np.zeros([h, w, 3])
+
+    for i in range(len(limbSeq)):
+        index = limbSeq[i]
+        color = color_list[index[0]]
+
+        x = kps[index][:, 0]
+        y = kps[index][:, 1]
+        length = ((x[0] - x[1]) ** 2 + (y[0] - y[1]) ** 2) ** 0.5
+        angle = math.degrees(math.atan2(y[0] - y[1], x[0] - x[1]))
+        polygon = cv2.ellipse2Poly((int(np.mean(x)), int(np.mean(y))), (int(length / 2), stickwidth), int(angle), 0, 360, 1)
+        out_img = cv2.fillConvexPoly(out_img.copy(), polygon, color)
+    out_img = (out_img * 0.6).astype(np.uint8)
+
+    for idx_kp, kp in enumerate(kps):
+        color = color_list[idx_kp]
+        x, y = kp
+        out_img = cv2.circle(out_img.copy(), (int(x), int(y)), 10, color, -1)
+
+    out_img_pil = PIL.Image.fromarray(out_img.astype(np.uint8))
+    return out_img_pil
     
 class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
     
@@ -567,7 +598,7 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
             if isinstance(attn_processor, IPAttnProcessor):
                 attn_processor.scale = scale
 
-    def _encode_prompt_image_emb(self, prompt_image_emb, device, dtype, do_classifier_free_guidance):
+    def _encode_prompt_image_emb(self, prompt_image_emb, device, num_images_per_prompt, dtype, do_classifier_free_guidance):
         
         if isinstance(prompt_image_emb, torch.Tensor):
             prompt_image_emb = prompt_image_emb.clone().detach()
@@ -583,6 +614,11 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
             prompt_image_emb = torch.cat([prompt_image_emb], dim=0)
         
         prompt_image_emb = self.image_proj_model(prompt_image_emb)
+
+        bs_embed, seq_len, _ = prompt_image_emb.shape
+        prompt_image_emb = prompt_image_emb.repeat(1, num_images_per_prompt, 1)
+        prompt_image_emb = prompt_image_emb.view(bs_embed * num_images_per_prompt, seq_len, -1)
+        
         return prompt_image_emb
 
     @torch.no_grad()
@@ -623,7 +659,13 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
         clip_skip: Optional[int] = None,
         callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
+
+        # IP adapter
+        ip_adapter_scale=None,
+
+        # Enhance Face Region
         control_mask = None,
+
         **kwargs,
     ):
         r"""
@@ -758,6 +800,7 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
                 If `return_dict` is `True`, [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] is returned,
                 otherwise a `tuple` is returned containing the output images.
         """
+
         lpw = LongPromptWeight()
 
         callback = kwargs.pop("callback", None)
@@ -789,6 +832,10 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
                 mult * [control_guidance_start],
                 mult * [control_guidance_end],
             )
+        
+        # 0. set ip_adapter_scale
+        if ip_adapter_scale is not None:
+            self.set_ip_adapter_scale(ip_adapter_scale)
 
         # 1. Check inputs. Raise error if not correct
         self.check_inputs(
@@ -851,6 +898,7 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
         # 3.2 Encode image prompt
         prompt_image_emb = self._encode_prompt_image_emb(image_embeds, 
                                                          device,
+                                                         num_images_per_prompt,
                                                          self.unet.dtype,
                                                          self.do_classifier_free_guidance)
         
@@ -1031,24 +1079,57 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
                         controlnet_cond_scale = controlnet_cond_scale[0]
                     cond_scale = controlnet_cond_scale * controlnet_keep[i]
 
-                down_block_res_samples, mid_block_res_sample = self.controlnet(
-                    control_model_input,
-                    t,
-                    encoder_hidden_states=prompt_image_emb,
-                    controlnet_cond=image,
-                    conditioning_scale=cond_scale,
-                    guess_mode=guess_mode,
-                    added_cond_kwargs=controlnet_added_cond_kwargs,
-                    return_dict=False,
-                )
+                if isinstance(self.controlnet, MultiControlNetModel):
+                    down_block_res_samples_list, mid_block_res_sample_list = [], []
+                    for control_index in range(len(self.controlnet.nets)):
+                        controlnet = self.controlnet.nets[control_index]
+                        if control_index == 0:
+                            # assume fhe first controlnet is IdentityNet
+                            controlnet_prompt_embeds = prompt_image_emb
+                        else:
+                            controlnet_prompt_embeds = prompt_embeds
+                        down_block_res_samples, mid_block_res_sample = controlnet(control_model_input,
+                                                                                  t,
+                                                                                  encoder_hidden_states=controlnet_prompt_embeds,
+                                                                                  controlnet_cond=image[control_index],
+                                                                                  conditioning_scale=cond_scale[control_index],
+                                                                                  guess_mode=guess_mode,
+                                                                                  added_cond_kwargs=controlnet_added_cond_kwargs,
+                                                                                  return_dict=False)
 
-                # controlnet mask
-                if control_mask_wight_image_list is not None:
-                    down_block_res_samples = [
-                        down_block_res_sample * mask_weight
-                        for down_block_res_sample, mask_weight in zip(down_block_res_samples, control_mask_wight_image_list)
-                    ]
-                    mid_block_res_sample *= control_mask_wight_image_list[-1]
+                        # controlnet mask
+                        if control_index == 0 and control_mask_wight_image_list is not None:
+                            down_block_res_samples = [
+                                down_block_res_sample * mask_weight
+                                for down_block_res_sample, mask_weight in zip(down_block_res_samples, control_mask_wight_image_list)
+                            ]
+                            mid_block_res_sample *= control_mask_wight_image_list[-1]
+
+                        down_block_res_samples_list.append(down_block_res_samples)
+                        mid_block_res_sample_list.append(mid_block_res_sample)
+
+                    mid_block_res_sample = torch.stack(mid_block_res_sample_list).sum(dim=0)
+                    down_block_res_samples = [torch.stack(down_block_res_samples).sum(dim=0) for down_block_res_samples in
+                                              zip(*down_block_res_samples_list)]
+                else:
+                    down_block_res_samples, mid_block_res_sample = self.controlnet(
+                        control_model_input,
+                        t,
+                        encoder_hidden_states=prompt_image_emb,
+                        controlnet_cond=image,
+                        conditioning_scale=cond_scale,
+                        guess_mode=guess_mode,
+                        added_cond_kwargs=controlnet_added_cond_kwargs,
+                        return_dict=False,
+                    )
+
+                    # controlnet mask
+                    if control_mask_wight_image_list is not None:
+                        down_block_res_samples = [
+                            down_block_res_sample * mask_weight
+                            for down_block_res_sample, mask_weight in zip(down_block_res_samples, control_mask_wight_image_list)
+                        ]
+                        mid_block_res_sample *= control_mask_wight_image_list[-1]
 
                 if guess_mode and self.do_classifier_free_guidance:
                     # Infered ControlNet only for the conditional batch.
