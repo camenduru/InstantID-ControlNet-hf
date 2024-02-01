@@ -613,6 +613,8 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
         else:
             prompt_image_emb = torch.cat([prompt_image_emb], dim=0)
         
+        print(prompt_image_emb.device)
+        print(self.image_proj_model.device)
         prompt_image_emb = self.image_proj_model(prompt_image_emb)
 
         bs_embed, seq_len, _ = prompt_image_emb.shape

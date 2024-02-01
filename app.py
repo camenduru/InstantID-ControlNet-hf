@@ -131,7 +131,6 @@ pipe.scheduler = diffusers.EulerDiscreteScheduler.from_config(
 
 pipe.cuda()
 pipe.load_ip_adapter_instantid(face_adapter)
-print(pipe.image_proj_model.device, pipe.unet.device)
 pipe.image_proj_model.to("cuda")
 pipe.unet.to("cuda")
 # load and disable LCM
