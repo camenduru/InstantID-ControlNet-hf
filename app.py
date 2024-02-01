@@ -4,6 +4,8 @@ import torch
 import random
 import numpy as np
 
+import spaces
+
 import PIL
 from PIL import Image
 
@@ -21,8 +23,6 @@ from pipeline_stable_diffusion_xl_instantid_full import StableDiffusionXLInstant
 from controlnet_util import openpose, get_depth_map, get_canny_image
 
 import gradio as gr
-
-import spaces
 
 # global variable
 MAX_SEED = np.iinfo(np.int32).max
