@@ -7,6 +7,7 @@ import spaces
 
 import PIL
 from PIL import Image
+from typing import Tuple
 
 import diffusers
 from diffusers.utils import load_image
@@ -21,8 +22,14 @@ from style_template import styles
 from pipeline_stable_diffusion_xl_instantid_full import StableDiffusionXLInstantIDPipeline, draw_kps
 
 from controlnet_aux import OpenposeDetector
-from transformers import DPTImageProcessor, DPTForDepthEstimation
+
 import gradio as gr
+
+from depth_anything.dpt import DepthAnything
+from depth_anything.util.transform import Resize, NormalizeImage, PrepareForNet
+
+import torch.nn.functional as F
+from torchvision.transforms import Compose
 
 # global variable
 MAX_SEED = np.iinfo(np.int32).max
@@ -51,9 +58,23 @@ app = FaceAnalysis(
 )
 app.prepare(ctx_id=0, det_size=(640, 640))
 
-depth_estimator = DPTForDepthEstimation.from_pretrained("Intel/dpt-hybrid-midas").to(device)
-feature_extractor = DPTImageProcessor.from_pretrained("Intel/dpt-hybrid-midas")
 openpose = OpenposeDetector.from_pretrained("lllyasviel/ControlNet")
+
+depth_anything = DepthAnything.from_pretrained('LiheYoung/depth_anything_vitl14').to(device).eval()
+
+transform = Compose([
+    Resize(
+        width=518,
+        height=518,
+        resize_target=False,
+        keep_aspect_ratio=True,
+        ensure_multiple_of=14,
+        resize_method='lower_bound',
+        image_interpolation_method=cv2.INTER_CUBIC,
+    ),
+    NormalizeImage(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    PrepareForNet(),
+])
 
 # Path to InstantID models
 face_adapter = f"./checkpoints/ip-adapter.bin"
@@ -80,24 +101,25 @@ controlnet_depth = ControlNetModel.from_pretrained(
 ).to(device)
 
 def get_depth_map(image):
-    image = feature_extractor(images=image, return_tensors="pt").pixel_values.to("cuda")
-    with torch.no_grad(), torch.autocast("cuda"):
-        depth_map = depth_estimator(image).predicted_depth
+    
+    image = np.array(image) / 255.0
 
-    depth_map = torch.nn.functional.interpolate(
-        depth_map.unsqueeze(1),
-        size=(1024, 1024),
-        mode="bicubic",
-        align_corners=False,
-    )
-    depth_min = torch.amin(depth_map, dim=[1, 2, 3], keepdim=True)
-    depth_max = torch.amax(depth_map, dim=[1, 2, 3], keepdim=True)
-    depth_map = (depth_map - depth_min) / (depth_max - depth_min)
-    image = torch.cat([depth_map] * 3, dim=1)
+    h, w = image.shape[:2]
 
-    image = image.permute(0, 2, 3, 1).cpu().numpy()[0]
-    image = Image.fromarray((image * 255.0).clip(0, 255).astype(np.uint8))
-    return image
+    image = transform({'image': image})['image']
+    image = torch.from_numpy(image).unsqueeze(0).to("cuda")
+
+    with torch.no_grad():
+        depth = depth_anything(image)
+
+    depth = F.interpolate(depth[None], (h, w), mode='bilinear', align_corners=False)[0, 0]
+    depth = (depth - depth.min()) / (depth.max() - depth.min()) * 255.0
+
+    depth = depth.cpu().numpy().astype(np.uint8)
+
+    depth_image = Image.fromarray(depth)
+
+    return depth_image
 
 def get_canny_image(image, t1=100, t2=200):
     image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
@@ -258,7 +280,7 @@ def resize_img(
 
 def apply_style(
     style_name: str, positive: str, negative: str = ""
-) -> tuple[str, str]:
+) -> Tuple[str, str]:
     p, n = styles.get(style_name, styles[DEFAULT_STYLE_NAME])
     return p.replace("{prompt}", positive), n + " " + negative
 
