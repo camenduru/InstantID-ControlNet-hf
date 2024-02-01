@@ -2,13 +2,12 @@ import torch
 import numpy as np
 from PIL import Image
 from controlnet_aux import OpenposeDetector
-from model_util import get_torch_device
 import cv2
 
 
 from transformers import DPTImageProcessor, DPTForDepthEstimation
 
-device = get_torch_device()
+device = "cuda" if torch.cuda.is_available() else "cpu"
 depth_estimator = DPTForDepthEstimation.from_pretrained("Intel/dpt-hybrid-midas").to(device)
 feature_extractor = DPTImageProcessor.from_pretrained("Intel/dpt-hybrid-midas")
 openpose = OpenposeDetector.from_pretrained("lllyasviel/ControlNet")
